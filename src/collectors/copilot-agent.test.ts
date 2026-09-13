@@ -706,6 +706,15 @@ describe("collectCopilotAgentMetrics", () => {
     for (const call of checksListMock.mock.calls) {
       expect(JSON.stringify(call[0])).not.toContain("4419865008");
     }
+
+    // The GraphQL resolution call itself must actually query by `global_id`
+    // (via `nodes(ids: $ids)`) rather than, say, being a no-op mock that
+    // would pass even if the implementation sent the database ID or no IDs
+    // at all.
+    expect(graphqlMock).toHaveBeenCalledWith(
+      expect.stringContaining("nodes(ids: $ids)"),
+      { ids: ["PR_kwDOsanitized"] },
+    );
   });
 
   it("skips an artifact resolved to a different repository (cross-repo mismatch)", async () => {
@@ -856,6 +865,61 @@ describe("collectCopilotAgentMetrics", () => {
         activeTasks: [expect.objectContaining({ id: "task-graphql-outage" })],
       }),
     );
+  });
+
+  it("splits more than 100 unique pull artifacts into batched GraphQL calls of at most 100 IDs", async () => {
+    // GitHub's `nodes(ids:)` field accepts at most 100 IDs per call, so 101
+    // unique global_ids referenced by one task's artifacts must produce two
+    // GraphQL calls (100 + 1), not one oversized request.
+    const recentDate = new Date(Date.now() - 1 * 24 * 3600 * 1000).toISOString();
+    const artifactCount = 101;
+    const artifacts = Array.from({ length: artifactCount }, (_, i) => ({
+      type: "pull",
+      data: { id: 9_000_000_000 + i, global_id: `PR_kwDOchunk${i}` },
+    }));
+    const rawTask = {
+      id: "task-chunking",
+      name: "Task with many PR artifacts",
+      state: "completed",
+      created_at: recentDate,
+      updated_at: recentDate,
+      html_url: "https://github.com/owner/repo/tasks/task-chunking",
+      session_count: 0,
+      artifacts,
+    };
+    const agentOctokit = makeMockOctokit([rawTask], { ...rawTask, sessions: [] });
+    setAgentOctokit(agentOctokit);
+
+    const pullsGetMock = vi.fn().mockResolvedValue({
+      data: { state: "open", head: { sha: "sha" } },
+    });
+    const checksListMock = vi.fn().mockResolvedValue({ data: { check_runs: [] } });
+    // Resolve each requested global_id to a distinct, valid PR number so the
+    // chunking behaviour (not the resolution logic itself) is what's under test.
+    const graphqlMock = vi
+      .fn()
+      .mockImplementation(async (_query: string, variables: { ids: string[] }) => ({
+        nodes: variables.ids.map((id) => ({
+          __typename: "PullRequest",
+          number: Number(id.replace("PR_kwDOchunk", "")) + 1,
+          repository: { owner: { login: "owner" }, name: "repo" },
+        })),
+      }));
+    setOctokit({
+      rest: { pulls: { get: pullsGetMock }, checks: { listForRef: checksListMock } },
+      graphql: graphqlMock,
+    } as unknown as Octokit);
+
+    const result = await collectCopilotAgentMetrics("owner", "repo");
+
+    expect(result).not.toBeNull();
+    expect(result!.agentCreatedPRs).toBe(artifactCount);
+
+    expect(graphqlMock).toHaveBeenCalledTimes(2);
+    const chunkSizes = graphqlMock.mock.calls
+      .map(([, variables]) => (variables as { ids: string[] }).ids.length)
+      .sort((a, b) => b - a);
+    expect(chunkSizes).toEqual([100, 1]);
   });
 });
 
