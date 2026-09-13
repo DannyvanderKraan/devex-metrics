@@ -17,8 +17,11 @@ import type { CopilotAgentTask, CopilotAgentRepoCache } from "../types.js";
 import type { Octokit } from "@octokit/rest";
 
 // ── Mock agent-cache so tests don't touch the filesystem ─────────────────────
+// Kept in sync with the real `AGENT_CACHE_SCHEMA_VERSION` in agent-cache.ts —
+// see agent-cache.test.ts for direct, unmocked coverage of the actual
+// version-mismatch rejection behaviour this constant enables.
 vi.mock("../agent-cache.js", () => ({
-  AGENT_CACHE_SCHEMA_VERSION: 1,
+  AGENT_CACHE_SCHEMA_VERSION: 2,
   loadAgentCache: vi.fn(),
   saveAgentCache: vi.fn(),
 }));
@@ -437,7 +440,7 @@ describe("collectCopilotAgentMetrics", () => {
   it("skips detail fetch for already-cached terminal tasks", async () => {
     const cachedTask = makeTask({ id: "task-cached", state: "completed" });
     const existingCache: CopilotAgentRepoCache = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       owner: "owner",
       repo: "repo",
       activeRefreshedAt: new Date().toISOString(),
@@ -477,7 +480,7 @@ describe("collectCopilotAgentMetrics", () => {
       createdAt: new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString(),
     });
     const existingCache: CopilotAgentRepoCache = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       owner: "owner",
       repo: "repo",
       activeRefreshedAt: new Date().toISOString(),
@@ -502,7 +505,7 @@ describe("collectCopilotAgentMetrics", () => {
       createdAt: new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString(),
     });
     mockLoadAgentCache.mockReturnValue({
-      schemaVersion: 1,
+      schemaVersion: 2,
       owner: "owner",
       repo: "repo",
       activeRefreshedAt: new Date().toISOString(),
@@ -544,7 +547,7 @@ describe("collectCopilotAgentMetrics", () => {
 
   it("replaces active tasks entirely on each run", async () => {
     mockLoadAgentCache.mockReturnValue({
-      schemaVersion: 1,
+      schemaVersion: 2,
       owner: "owner",
       repo: "repo",
       activeRefreshedAt: new Date().toISOString(),
