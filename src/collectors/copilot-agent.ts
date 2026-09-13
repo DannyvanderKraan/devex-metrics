@@ -268,6 +268,23 @@ interface ResolvePRNumbersResponse {
 }
 
 /**
+ * Result of a pull-artifact `global_id` resolution pass.
+ *
+ * `resolved` maps a `global_id` to its confirmed repository-scoped PR
+ * `number`. `failed` holds `global_id`s whose resolution could not be
+ * completed this run (GraphQL request error, or no REST-capable Octokit
+ * available at all) — as opposed to `global_id`s that resolved cleanly but
+ * were deliberately rejected (invalid/missing number, cross-repository
+ * match). That distinction matters to the caller: a `failed` id represents
+ * a transient condition that should be retried on the next run, not a
+ * permanently-invalid artifact.
+ */
+interface ResolvePRNumbersResult {
+  resolved: Map<string, number>;
+  failed: Set<string>;
+}
+
+/**
  * Resolve pull-artifact `global_id`s (GraphQL node IDs) to the repository-
  * scoped PR `number` required for REST calls.
  *
@@ -277,15 +294,21 @@ interface ResolvePRNumbersResponse {
  * verified rather than assumed, and any node ID that fails to resolve to a
  * valid, matching PR is dropped with a diagnostic rather than substituting
  * the (incorrect) database ID.
+ *
+ * `global_id`s affected by a request-level failure (rather than a
+ * definitive "invalid" or "cross-repository" result) are reported via
+ * `failed` so the caller can avoid permanently caching tasks that
+ * reference them — see `ResolvePRNumbersResult`.
  */
 async function resolveAgentPullRequestNumbers(
   octokit: Octokit,
   owner: string,
   repo: string,
   globalIds: string[],
-): Promise<Map<string, number>> {
+): Promise<ResolvePRNumbersResult> {
   const resolved = new Map<string, number>();
-  if (globalIds.length === 0) return resolved;
+  const failed = new Set<string>();
+  if (globalIds.length === 0) return { resolved, failed };
 
   // GitHub's `nodes(ids:)` field accepts at most 100 IDs per call.
   const CHUNK_SIZE = 100;
@@ -301,8 +324,10 @@ async function resolveAgentPullRequestNumbers(
     } catch (err: unknown) {
       console.warn(
         `  ⚠ copilot-agent: unable to resolve PR numbers for ${owner}/${repo} ` +
-          `(GraphQL node lookup failed): ${err instanceof Error ? err.message : String(err)}`,
+          `(GraphQL node lookup failed): ${err instanceof Error ? err.message : String(err)}. ` +
+          `Affected tasks will be retried on the next run.`,
       );
+      for (const globalId of chunk) failed.add(globalId);
       continue;
     }
 
@@ -332,7 +357,7 @@ async function resolveAgentPullRequestNumbers(
     });
   }
 
-  return resolved;
+  return { resolved, failed };
 }
 
 /**
@@ -563,9 +588,13 @@ export async function collectCopilotAgentMetrics(
       }
     }
   }
-  const resolvedPRNumbers = restOctokit
+  // No REST-capable Octokit at all is treated the same as a per-chunk
+  // GraphQL failure below: every referenced `global_id` is "unresolved this
+  // run" rather than "definitively invalid", so affected tasks must not be
+  // permanently cached (see the `failed` handling further down).
+  const { resolved: resolvedPRNumbers, failed: unresolvedGlobalIds } = restOctokit
     ? await resolveAgentPullRequestNumbers(restOctokit, owner, repo, [...pullGlobalIds])
-    : new Map<string, number>();
+    : { resolved: new Map<string, number>(), failed: pullGlobalIds };
 
   for (const rawTask of pendingTasks) {
     const detail: RawTaskDetail = taskDetails.get(rawTask.id) ?? { ...rawTask, sessions: [] };
@@ -574,6 +603,17 @@ export async function collectCopilotAgentMetrics(
       .filter((a) => a.type === "pull" && a.data.global_id)
       .map((a) => resolvedPRNumbers.get(a.data.global_id!))
       .filter((n): n is number => typeof n === "number");
+
+    // A task referencing a `global_id` that failed to resolve this run
+    // (transient GraphQL error, or no REST-capable Octokit available) must
+    // not be memorialised into the permanent terminal cache: doing so would
+    // make `cachedTerminalIds` skip it on every future run, permanently
+    // losing its PR/Actions-minutes association once the outage clears.
+    // Treat it as still-pending instead, so it is refetched and re-resolved
+    // on the next run.
+    const hasUnresolvedArtifact = (rawTask.artifacts ?? []).some(
+      (a) => a.type === "pull" && a.data.global_id && unresolvedGlobalIds.has(a.data.global_id),
+    );
 
     const task: CopilotAgentTask = {
       id: rawTask.id,
@@ -586,7 +626,7 @@ export async function collectCopilotAgentMetrics(
       prNumbers,
     };
 
-    if (TERMINAL_STATES.has(rawTask.state)) {
+    if (TERMINAL_STATES.has(rawTask.state) && !hasUnresolvedArtifact) {
       newTerminalTasks.push(task);
     } else {
       newActiveTasks.push(task);

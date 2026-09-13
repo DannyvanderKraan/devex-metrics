@@ -808,6 +808,52 @@ describe("collectCopilotAgentMetrics", () => {
     // No global_id means nothing to resolve — GraphQL should not even be called.
     expect(graphqlMock).not.toHaveBeenCalled();
   });
+
+  it("does not permanently cache a terminal task whose PR-number resolution failed transiently", async () => {
+    const recentDate = new Date(Date.now() - 1 * 24 * 3600 * 1000).toISOString();
+    const rawTask = {
+      id: "task-graphql-outage",
+      name: "Task hit during a GraphQL outage",
+      state: "completed",
+      created_at: recentDate,
+      updated_at: recentDate,
+      html_url: "https://github.com/owner/repo/tasks/task-graphql-outage",
+      session_count: 0,
+      artifacts: [
+        { type: "pull", data: { id: 5566778800, global_id: "PR_kwDOoutage" } },
+      ],
+    };
+    const agentOctokit = makeMockOctokit([rawTask], { ...rawTask, sessions: [] });
+    setAgentOctokit(agentOctokit);
+
+    const pullsGetMock = vi.fn();
+    // Simulate a transient GraphQL failure (e.g. a momentary outage) rather
+    // than a definitive "invalid"/"cross-repo" result.
+    const graphqlMock = vi.fn().mockRejectedValue(new Error("GraphQL request failed"));
+    setOctokit({
+      rest: { pulls: { get: pullsGetMock }, checks: { listForRef: vi.fn() } },
+      graphql: graphqlMock,
+    } as unknown as Octokit);
+
+    const result = await collectCopilotAgentMetrics("owner", "repo");
+
+    expect(result).not.toBeNull();
+    // No PR number could be resolved this run, so it does not count yet.
+    expect(result!.agentCreatedPRs).toBe(0);
+    expect(pullsGetMock).not.toHaveBeenCalled();
+
+    // Critically: the task must NOT land in the permanent terminal cache —
+    // otherwise `cachedTerminalIds` would skip it on every future run,
+    // permanently losing its PR association once the outage clears.
+    expect(mockSaveAgentCache).toHaveBeenCalledWith(
+      "owner",
+      "repo",
+      expect.objectContaining({
+        terminalTasks: [],
+        activeTasks: [expect.objectContaining({ id: "task-graphql-outage" })],
+      }),
+    );
+  });
 });
 
 // ── Unit: collectActionsMinutesForPRs ─────────────────────────────────────────
